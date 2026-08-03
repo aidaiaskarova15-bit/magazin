@@ -52,10 +52,10 @@ nav{
   padding-bottom:env(safe-area-inset-bottom);
 }
 nav button{
-  flex:1; background:none; border:none; padding:10px 2px 8px; font-family:var(--sans);
-  font-size:11px; color:var(--ink-soft); display:flex; flex-direction:column; align-items:center; gap:4px;
+  flex:1; background:none; border:none; padding:9px 1px 7px; font-family:var(--sans);
+  font-size:9.5px; color:var(--ink-soft); display:flex; flex-direction:column; align-items:center; gap:3px;
 }
-nav button .ic{font-size:19px;}
+nav button .ic{font-size:16px;}
 nav button.active{color:var(--primary); font-weight:700;}
 nav button.active .ic{color:var(--accent);}
 
@@ -169,15 +169,18 @@ label{font-size:12px; color:var(--ink-soft); font-weight:600; display:block; mar
     <button data-tab="kassa" class="active"><span class="ic">🧾</span>Касса</button>
     <button data-tab="prihod"><span class="ic">📥</span>Приход</button>
     <button data-tab="catalog"><span class="ic">📦</span>Каталог</button>
+    <button data-tab="debts"><span class="ic">📒</span>Долги</button>
     <button data-tab="reports"><span class="ic">📊</span>Отчёты</button>
     <button data-tab="settings"><span class="ic">⚙️</span>Настройки</button>
   </nav>
 </div>
 
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script>
 /* ============ ХРАНИЛИЩЕ (IndexedDB) ============ */
-const DB_NAME = 'shopPosDB', DB_VER = 1;
+const DB_NAME = 'shopPosDB', DB_VER = 2;
 let db;
 function openDB(){
   return new Promise((res, rej)=>{
@@ -188,16 +191,76 @@ function openDB(){
       if(!d.objectStoreNames.contains('sales')) d.createObjectStore('sales', {keyPath:'id'});
       if(!d.objectStoreNames.contains('receipts')) d.createObjectStore('receipts', {keyPath:'id'});
       if(!d.objectStoreNames.contains('meta')) d.createObjectStore('meta', {keyPath:'key'});
+      if(!d.objectStoreNames.contains('debtors')) d.createObjectStore('debtors', {keyPath:'id'});
     };
     req.onsuccess = e=>{db=e.target.result; res(db);};
     req.onerror = e=>rej(e);
   });
 }
 function tx(store, mode='readonly'){ return db.transaction(store, mode).objectStore(store); }
-function idbGetAll(store){ return new Promise((res)=>{ const r = tx(store).getAll(); r.onsuccess=()=>res(r.result||[]); r.onerror=()=>res([]); }); }
-function idbGet(store, key){ return new Promise((res)=>{ const r = tx(store).get(key); r.onsuccess=()=>res(r.result||null); r.onerror=()=>res(null); }); }
-function idbPut(store, val){ return new Promise((res,rej)=>{ const r = tx(store,'readwrite').put(val); r.onsuccess=()=>res(val); r.onerror=(e)=>rej(e); }); }
-function idbDelete(store, key){ return new Promise((res)=>{ const r = tx(store,'readwrite').delete(key); r.onsuccess=()=>res(true); }); }
+function idbGetAllLocal(store){ return new Promise((res)=>{ const r = tx(store).getAll(); r.onsuccess=()=>res(r.result||[]); r.onerror=()=>res([]); }); }
+function idbGetLocal(store, key){ return new Promise((res)=>{ const r = tx(store).get(key); r.onsuccess=()=>res(r.result||null); r.onerror=()=>res(null); }); }
+function idbPutLocal(store, val){ return new Promise((res,rej)=>{ const r = tx(store,'readwrite').put(val); r.onsuccess=()=>res(val); r.onerror=(e)=>rej(e); }); }
+function idbDeleteLocal(store, key){ return new Promise((res)=>{ const r = tx(store,'readwrite').delete(key); r.onsuccess=()=>res(true); }); }
+
+/* ============ ОБЛАЧНАЯ БАЗА (Firebase) — для работы с нескольких устройств ============ */
+let cloudMode = false;
+let fsDB = null;
+const CLOUD_META_KEYS = ['shopName','kkm','yakassa']; // эти настройки общие для всех устройств
+
+async function initCloud(){
+  const cfg = await idbGetLocal('meta','firebaseConfig');
+  if(!cfg || !cfg.value) return false;
+  try{
+    firebase.initializeApp(cfg.value);
+    fsDB = firebase.firestore();
+    cloudMode = true;
+    return true;
+  }catch(err){
+    console.error('Firebase init error', err);
+    toast('Не удалось подключиться к общей базе. Работаем локально на этом устройстве.');
+    return false;
+  }
+}
+function fsCol(store){ return fsDB.collection(store); }
+async function fsGetAll(store){
+  const snap = await fsCol(store).get();
+  return snap.docs.map(d=>d.data());
+}
+async function fsGet(store, key){
+  const doc = await fsCol(store).doc(String(key)).get();
+  return doc.exists ? doc.data() : null;
+}
+async function fsPut(store, val){
+  const key = store==='products' ? val.barcode : (val.id || val.key);
+  await fsCol(store).doc(String(key)).set(val);
+  return val;
+}
+async function fsDelete(store, key){
+  await fsCol(store).doc(String(key)).delete();
+  return true;
+}
+
+/* Роутер: если облако включено, товары/продажи/должники всегда идут туда — так все устройства видят одно и то же */
+const CLOUD_STORES = ['products','sales','debtors'];
+async function idbGetAll(store){
+  if(cloudMode && CLOUD_STORES.includes(store)) return fsGetAll(store);
+  return idbGetAllLocal(store);
+}
+async function idbGet(store, key){
+  if(cloudMode && CLOUD_STORES.includes(store)) return fsGet(store, key);
+  if(cloudMode && store==='meta' && CLOUD_META_KEYS.includes(key)) return fsGet('meta', key);
+  return idbGetLocal(store, key);
+}
+async function idbPut(store, val){
+  if(cloudMode && CLOUD_STORES.includes(store)) return fsPut(store, val);
+  if(cloudMode && store==='meta' && CLOUD_META_KEYS.includes(val.key)) return fsPut('meta', val);
+  return idbPutLocal(store, val);
+}
+async function idbDelete(store, key){
+  if(cloudMode && CLOUD_STORES.includes(store)) return fsDelete(store, key);
+  return idbDeleteLocal(store, key);
+}
 
 /* ============ УТИЛИТЫ ============ */
 const fmt = n => (Math.round(n*100)/100).toLocaleString('ru-RU', {minimumFractionDigits:2, maximumFractionDigits:2});
@@ -210,7 +273,9 @@ function todayKey(d=new Date()){ return d.toISOString().slice(0,10); }
 
 /* ============ СОСТОЯНИЕ ============ */
 let currentTab = 'kassa';
-let cart = []; // {barcode,name,price,qty}
+let cart = []; // {barcode,name,retailPrice,wholesalePrice,mode,price,qty}
+let saleMode = 'pay'; // 'pay' | 'debt'
+let saleDebtorName = '';
 let scannerCtrl = null;
 let scannerMode = null; // 'kassa' | 'prihod' | 'catalog'
 
@@ -233,6 +298,7 @@ async function render(){
   if(currentTab==='kassa') main.innerHTML = await viewKassa();
   else if(currentTab==='prihod') main.innerHTML = await viewPrihod();
   else if(currentTab==='catalog') main.innerHTML = await viewCatalog();
+  else if(currentTab==='debts') main.innerHTML = await viewDebts();
   else if(currentTab==='reports') main.innerHTML = await viewReports();
   else if(currentTab==='settings') main.innerHTML = await viewSettings();
   bindDynamicHandlers();
@@ -249,6 +315,7 @@ async function startScanner(mode, onResult){
   scannerMode = mode;
   const wrap = document.getElementById('scanner-wrap');
   if(!wrap) return;
+  let scanLocked = false;
   try{
     scannerCtrl = new Html5Qrcode("reader");
     const config = { fps:10, qrbox:{width:250,height:130}, formatsToSupport:[
@@ -257,8 +324,17 @@ async function startScanner(mode, onResult){
       Html5QrcodeSupportedFormats.CODE_128, Html5QrcodeSupportedFormats.CODE_39, Html5QrcodeSupportedFormats.QR_CODE
     ]};
     await scannerCtrl.start({facingMode:"environment"}, config, (decodedText)=>{
+      if(scanLocked) return; // игнорируем повторные срабатывания, пока штрихкод ещё в кадре
+      scanLocked = true;
       if(navigator.vibrate) navigator.vibrate(60);
+      const hint = wrap.querySelector('.scan-hint');
+      if(hint){ hint.textContent = '✓ Добавлено — уберите штрихкод из кадра'; hint.style.color = '#8FD9A8'; }
       onResult(decodedText);
+      setTimeout(()=>{
+        scanLocked = false;
+        const hintNow = document.querySelector('#scanner-wrap .scan-hint');
+        if(hintNow){ hintNow.textContent = 'Наведите камеру на штрихкод'; hintNow.style.color = '#fff'; }
+      }, 1500);
     }, ()=>{});
   }catch(err){
     wrap.innerHTML = `<div class="empty"><div class="big">🚫</div><p>Нет доступа к камере.<br>Разрешите камеру в браузере или введите код вручную ниже.</p></div>`;
@@ -279,14 +355,28 @@ async function viewKassa(){
   ${scannerHTML('Наведите камеру на штрихкод товара')}
   <div class="card" style="padding:10px 12px;">
     <div class="row">
-      <input id="manualBarcode" placeholder="Или введите штрихкод вручную" inputmode="numeric">
+      <input id="manualBarcode" placeholder="Штрихкод вручную" inputmode="numeric">
       <button class="btn btn-ghost" style="width:auto; padding:11px 14px;" id="manualAddBtn">＋</button>
     </div>
   </div>
+  <div class="card" style="padding:10px 12px; position:relative;">
+    <input id="kassaSearch" placeholder="🔍 Или найдите товар по названию">
+    <div id="kassaSearchResults"></div>
+  </div>
+
+  <div class="row" style="margin-bottom:12px; gap:8px;">
+    <button class="btn ${saleMode==='pay'?'btn-primary':'btn-ghost'}" id="modePayBtn">💵 Оплата сейчас</button>
+    <button class="btn ${saleMode==='debt'?'btn-primary':'btn-ghost'}" id="modeDebtBtn">📒 В долг</button>
+  </div>
+  ${saleMode==='debt' ? `
+  <div class="card" style="padding:10px 12px;">
+    <label>Имя должника</label>
+    <input id="debtorNameInput" placeholder="Например: Айгуль" value="${(saleDebtorName||'').replace(/"/g,'&quot;')}">
+  </div>` : ''}
 
   <div class="total-bar">
     <div><div class="label">Итого чек · ${count} шт.</div><div class="amount">${fmt(total)} сом</div></div>
-    <button class="btn btn-accent" style="width:auto; padding:12px 20px;" id="checkoutBtn" ${cart.length? '':'disabled'}>Оформить</button>
+    <button class="btn btn-accent" style="width:auto; padding:12px 20px;" id="checkoutBtn" ${cart.length? '':'disabled'}>${saleMode==='debt'?'В долг':'Оформить'}</button>
   </div>
 
   <div class="card">
@@ -297,6 +387,7 @@ async function viewKassa(){
           <div class="name">${i.name}</div>
           <div class="meta">${fmt(i.price)} сом/шт · ${i.barcode}</div>
         </div>
+        ${i.wholesalePrice ? `<button data-act="mode" data-idx="${idx}" class="badge ${i.mode==='wholesale'?'badge-accent':'badge-ok'}" style="border:none;">${i.mode==='wholesale'?'ОПТ':'РОЗН'}</button>` : ''}
         <div class="qty-stepper">
           <button data-act="dec" data-idx="${idx}">−</button>
           <span>${i.qty}</span>
@@ -305,9 +396,13 @@ async function viewKassa(){
         <div class="line-total">${fmt(i.price*i.qty)}</div>
         <button data-act="rm" data-idx="${idx}" style="background:none;border:none;color:var(--danger);font-size:18px;">✕</button>
       </div>
-    `).join('') : `<div class="empty"><div class="big">🧾</div><p>Отсканируйте товар — он появится здесь</p></div>`}
+    `).join('') : `<div class="empty"><div class="big">🧾</div><p>Отсканируйте или найдите товар — он появится здесь</p></div>`}
   </div>
   `;
+}
+
+function cartLineFromProduct(p){
+  return { barcode:p.barcode, name:p.name, retailPrice:p.price, wholesalePrice:p.wholesalePrice||0, mode:'retail', price:p.price, qty:1 };
 }
 
 async function addToCart(barcode){
@@ -316,7 +411,7 @@ async function addToCart(barcode){
   if(p.qty <= 0){ toast(`«${p.name}» — товара нет на складе`); }
   const existing = cart.find(i=>i.barcode===barcode);
   if(existing) existing.qty += 1;
-  else cart.push({barcode:p.barcode, name:p.name, price:p.price, qty:1});
+  else cart.push(cartLineFromProduct(p));
   render();
 }
 
@@ -330,12 +425,45 @@ function bindKassaHandlers(){
     if(v) addToCart(v);
   });
 
+  const searchInput = document.getElementById('kassaSearch');
+  if(searchInput) searchInput.addEventListener('input', async ()=>{
+    const q = searchInput.value.trim().toLowerCase();
+    const box = document.getElementById('kassaSearchResults');
+    if(!q){ box.innerHTML=''; return; }
+    const products = await idbGetAll('products');
+    const found = products.filter(p=>p.name.toLowerCase().includes(q)).slice(0,6);
+    box.innerHTML = found.length ? found.map(p=>`
+      <div class="item-row" data-barcode="${p.barcode}" style="cursor:pointer;">
+        <div class="info"><div class="name">${p.name}</div><div class="meta">${fmt(p.price)} сом · остаток ${p.qty}</div></div>
+        <button class="badge badge-accent" style="border:none;">Добавить</button>
+      </div>
+    `).join('') : `<div class="empty" style="padding:10px;"><p>Ничего не найдено</p></div>`;
+    box.querySelectorAll('[data-barcode]').forEach(row=>{
+      row.addEventListener('click', ()=>{
+        addToCart(row.dataset.barcode);
+        searchInput.value=''; box.innerHTML='';
+      });
+    });
+  });
+
+  const modePayBtn = document.getElementById('modePayBtn');
+  const modeDebtBtn = document.getElementById('modeDebtBtn');
+  if(modePayBtn) modePayBtn.onclick = ()=>{ saleMode='pay'; render(); };
+  if(modeDebtBtn) modeDebtBtn.onclick = ()=>{ saleMode='debt'; render(); };
+  const debtorInput = document.getElementById('debtorNameInput');
+  if(debtorInput) debtorInput.addEventListener('input', ()=>{ saleDebtorName = debtorInput.value; });
+
   document.querySelectorAll('[data-act]').forEach(b=>{
     b.addEventListener('click', ()=>{
       const idx = +b.dataset.idx, act = b.dataset.act;
       if(act==='inc') cart[idx].qty++;
       if(act==='dec'){ cart[idx].qty--; if(cart[idx].qty<=0) cart.splice(idx,1); }
       if(act==='rm') cart.splice(idx,1);
+      if(act==='mode'){
+        const i = cart[idx];
+        i.mode = i.mode==='retail' ? 'wholesale' : 'retail';
+        i.price = i.mode==='retail' ? i.retailPrice : i.wholesalePrice;
+      }
       render();
     });
   });
@@ -346,13 +474,22 @@ function bindKassaHandlers(){
 
 async function checkout(){
   if(!cart.length) return;
+  if(saleMode==='debt'){
+    const nameInput = document.getElementById('debtorNameInput');
+    const name = (nameInput ? nameInput.value : saleDebtorName).trim();
+    if(!name){ toast('Введите имя должника'); return; }
+    saleDebtorName = name;
+  }
   // проверка остатков
   for(const i of cart){
     const p = await idbGet('products', i.barcode);
     if(p) i.name = p.name;
   }
   const total = cart.reduce((s,i)=>s+i.price*i.qty,0);
-  const sale = { id: uid(), date: new Date().toISOString(), items: cart.map(i=>({...i})), total };
+  const sale = {
+    id: uid(), date: new Date().toISOString(), items: cart.map(i=>({...i})), total,
+    paymentType: saleMode, debtorName: saleMode==='debt' ? saleDebtorName : null
+  };
 
   // списание остатков
   for(const i of cart){
@@ -360,8 +497,19 @@ async function checkout(){
     if(p){ p.qty = Math.max(0, (p.qty||0) - i.qty); await idbPut('products', p); }
   }
   await idbPut('sales', sale);
+
+  if(saleMode==='debt'){
+    const debtor = await findOrCreateDebtor(saleDebtorName);
+    debtor.balance = (debtor.balance||0) + total;
+    debtor.history = debtor.history || [];
+    debtor.history.push({id:uid(), date:new Date().toISOString(), type:'charge', amount: total, note:`Чек №${sale.id.slice(-6).toUpperCase()}`});
+    await idbPut('debtors', debtor);
+    toast(`Записано в долг: ${debtor.name}`);
+  }
+
   showReceiptModal(sale);
   cart = [];
+  saleMode = 'pay'; saleDebtorName = '';
   render();
 }
 
@@ -375,9 +523,10 @@ function showReceiptModal(sale){
       <div class="receipt">
         <div class="center"><b>${shopName}</b></div>
         <div class="center">${new Date(sale.date).toLocaleString('ru-RU')}</div>
+        ${sale.paymentType==='debt' ? `<div class="center" style="color:var(--danger); font-weight:700;">В ДОЛГ · ${sale.debtorName||''}</div>` : ''}
         <hr>
         ${sale.items.map(i=>`
-          <div class="rline"><span>${i.name}</span></div>
+          <div class="rline"><span>${i.name}${i.mode==='wholesale'?' (опт)':''}</span></div>
           <div class="rline"><span>${i.qty} × ${fmt(i.price)}</span><span>${fmt(i.qty*i.price)}</span></div>
         `).join('')}
         <hr>
@@ -495,6 +644,7 @@ function openPrihodModal(barcode, existing){
           <div class="field"><label>Цена продажи (сом)</label><input id="newPrice" type="number" inputmode="decimal"></div>
           <div class="field"><label>Закупочная цена (сом)</label><input id="newCost" type="number" inputmode="decimal"></div>
         </div>
+        <div class="field"><label>Оптовая цена за шт., сом — если продаёте блоками (необязательно)</label><input id="newWholesale" type="number" inputmode="decimal" placeholder="Оставьте пустым, если нет"></div>
         <div class="field"><label>Количество (приход)</label><input id="newQty" type="number" inputmode="numeric" value="1" min="0"></div>
         <button class="btn btn-primary" id="saveNewProduct">Сохранить и оприходовать</button>
       </div>
@@ -522,6 +672,7 @@ function openPrihodModal(barcode, existing){
         barcode, name,
         category: document.getElementById('newCat').value.trim(),
         price, cost: +document.getElementById('newCost').value || 0,
+        wholesalePrice: +document.getElementById('newWholesale').value || 0,
         qty: +document.getElementById('newQty').value || 0,
         createdAt: new Date().toISOString()
       };
@@ -610,6 +761,7 @@ function openEditProductModal(p){
         <div class="field"><label>Цена продажи</label><input id="editPrice" type="number" value="${p.price}"></div>
         <div class="field"><label>Закупочная цена</label><input id="editCost" type="number" value="${p.cost||0}"></div>
       </div>
+      <div class="field"><label>Оптовая цена за шт., сом — если продаёте блоками (необязательно)</label><input id="editWholesale" type="number" value="${p.wholesalePrice||''}" placeholder="Оставьте пустым, если нет"></div>
       <div class="field"><label>Остаток на складе</label><input id="editQty" type="number" value="${p.qty}"></div>
       <div class="field"><label>Штрихкод</label><input value="${p.barcode}" disabled style="opacity:.6;"></div>
       <button class="btn btn-primary" id="saveEdit">Сохранить</button>
@@ -624,6 +776,7 @@ function openEditProductModal(p){
     p.category = document.getElementById('editCat').value.trim();
     p.price = +document.getElementById('editPrice').value || 0;
     p.cost = +document.getElementById('editCost').value || 0;
+    p.wholesalePrice = +document.getElementById('editWholesale').value || 0;
     p.qty = +document.getElementById('editQty').value || 0;
     await idbPut('products', p);
     document.getElementById('editModal').remove();
@@ -638,7 +791,170 @@ function openEditProductModal(p){
   };
 }
 
-/* ============ ОТЧЁТЫ ============ */
+/* ============ ДОЛГИ ============ */
+async function viewDebts(){
+  const debtors = await idbGetAll('debtors');
+  debtors.sort((a,b)=> (b.balance||0) - (a.balance||0));
+  const totalOwed = debtors.reduce((s,d)=> s + Math.max(0, d.balance||0), 0);
+  return `
+  <div class="total-bar">
+    <div><div class="label">Всего должны магазину</div><div class="amount">${fmt(totalOwed)} сом</div></div>
+  </div>
+  <div class="card" style="padding:10px 12px;">
+    <input id="debtSearch" placeholder="🔍 Поиск должника по имени">
+  </div>
+  <button class="btn btn-primary" id="addDebtorBtn" style="margin-bottom:12px;">＋ Новый должник</button>
+  <div class="card" id="debtorsList">
+    ${renderDebtorsList(debtors)}
+  </div>
+  `;
+}
+function renderDebtorsList(debtors){
+  if(!debtors.length) return `<div class="empty"><div class="big">📒</div><p>Пока никто не должен — список пуст</p></div>`;
+  return debtors.map(d=>`
+    <div class="item-row" data-id="${d.id}">
+      <div class="info">
+        <div class="name">${d.name}</div>
+        <div class="meta">${d.phone||'без телефона'}</div>
+      </div>
+      <div style="text-align:right;">
+        <div style="font-family:var(--mono); font-weight:700;" class="${(d.balance||0)>0?'':'badge-ok'}">${fmt(d.balance||0)} сом</div>
+        <span class="badge ${(d.balance||0)>0?'badge-low':'badge-ok'}">${(d.balance||0)>0?'должен':'нет долга'}</span>
+      </div>
+    </div>
+  `).join('');
+}
+function bindDebtsHandlers(){
+  const search = document.getElementById('debtSearch');
+  if(search) search.addEventListener('input', async ()=>{
+    const q = search.value.trim().toLowerCase();
+    const debtors = await idbGetAll('debtors');
+    debtors.sort((a,b)=> (b.balance||0) - (a.balance||0));
+    const filtered = debtors.filter(d=>d.name.toLowerCase().includes(q));
+    document.getElementById('debtorsList').innerHTML = renderDebtorsList(filtered);
+    bindDebtorRowHandlers();
+  });
+  const addBtn = document.getElementById('addDebtorBtn');
+  if(addBtn) addBtn.onclick = openNewDebtorModal;
+  bindDebtorRowHandlers();
+}
+function bindDebtorRowHandlers(){
+  document.querySelectorAll('#debtorsList .item-row').forEach(row=>{
+    row.addEventListener('click', async ()=>{
+      const d = await idbGet('debtors', row.dataset.id);
+      if(d) openDebtorModal(d);
+    });
+  });
+}
+function openNewDebtorModal(){
+  const html = `
+  <div class="modal-bg" id="newDebtorModal">
+    <div class="modal" style="position:relative;">
+      <button class="modal-close" id="closeNewDebtor">✕</button>
+      <h3>Новый должник</h3>
+      <div class="field"><label>Имя</label><input id="ndName" placeholder="Например: Айгуль"></div>
+      <div class="field"><label>Телефон (необязательно)</label><input id="ndPhone" placeholder="0700 000 000" inputmode="tel"></div>
+      <div class="field"><label>Сумма долга сейчас (сом), если уже есть</label><input id="ndAmount" type="number" inputmode="decimal" value="0"></div>
+      <button class="btn btn-primary" id="ndSave">Сохранить</button>
+    </div>
+  </div>`;
+  document.body.insertAdjacentHTML('beforeend', html);
+  document.getElementById('closeNewDebtor').onclick = ()=>document.getElementById('newDebtorModal').remove();
+  document.getElementById('ndSave').onclick = async ()=>{
+    const name = document.getElementById('ndName').value.trim();
+    if(!name){ toast('Введите имя'); return; }
+    const amount = +document.getElementById('ndAmount').value || 0;
+    const debtor = {
+      id: uid(), name, phone: document.getElementById('ndPhone').value.trim(),
+      balance: amount, history: amount? [{id:uid(), date:new Date().toISOString(), type:'charge', amount, note:'Начальный долг'}] : []
+    };
+    await idbPut('debtors', debtor);
+    document.getElementById('newDebtorModal').remove();
+    toast(`Должник «${name}» добавлен`);
+    render();
+  };
+}
+function openDebtorModal(d){
+  const html = `
+  <div class="modal-bg" id="debtorModal">
+    <div class="modal" style="position:relative;">
+      <button class="modal-close" id="closeDebtor">✕</button>
+      <h3>${d.name}</h3>
+      <div class="card" style="text-align:center; margin-bottom:14px;">
+        <div class="section-title" style="margin-bottom:2px;">Текущий долг</div>
+        <div style="font-family:var(--mono); font-size:26px; font-weight:700; color:${(d.balance||0)>0?'var(--danger)':'var(--ok)'};">${fmt(d.balance||0)} сом</div>
+      </div>
+      <div class="row" style="margin-bottom:14px;">
+        <button class="btn btn-accent" id="addPaymentBtn">Принять оплату</button>
+        <button class="btn btn-ghost" id="addChargeBtn">Добавить долг</button>
+      </div>
+      <div class="section-title">История</div>
+      <div>
+        ${(d.history&&d.history.length) ? [...d.history].reverse().map(h=>`
+          <div class="item-row">
+            <div class="info">
+              <div class="name">${h.type==='payment'?'Оплата':'Долг'}${h.note?' · '+h.note:''}</div>
+              <div class="meta">${new Date(h.date).toLocaleString('ru-RU')}</div>
+            </div>
+            <div class="line-total" style="color:${h.type==='payment'?'var(--ok)':'var(--danger)'};">${h.type==='payment'?'−':'+'}${fmt(h.amount)}</div>
+          </div>
+        `).join('') : `<div class="empty"><p>Операций пока не было</p></div>`}
+      </div>
+      <div style="height:8px;"></div>
+      <button class="btn btn-danger" id="deleteDebtorBtn">Удалить должника</button>
+    </div>
+  </div>`;
+  document.body.insertAdjacentHTML('beforeend', html);
+  document.getElementById('closeDebtor').onclick = ()=>{ document.getElementById('debtorModal').remove(); render(); };
+  document.getElementById('addPaymentBtn').onclick = ()=>openDebtAmountPrompt(d, 'payment');
+  document.getElementById('addChargeBtn').onclick = ()=>openDebtAmountPrompt(d, 'charge');
+  document.getElementById('deleteDebtorBtn').onclick = async ()=>{
+    if(!confirm(`Удалить должника «${d.name}» вместе с историей?`)) return;
+    await idbDelete('debtors', d.id);
+    document.getElementById('debtorModal').remove();
+    toast('Должник удалён');
+    render();
+  };
+}
+function openDebtAmountPrompt(d, type){
+  const title = type==='payment' ? 'Принять оплату' : 'Добавить долг';
+  const html = `
+  <div class="modal-bg" id="amountModal">
+    <div class="modal" style="position:relative;">
+      <button class="modal-close" id="closeAmount">✕</button>
+      <h3>${title}</h3>
+      <div class="field"><label>Сумма (сом)</label><input id="amtValue" type="number" inputmode="decimal" autofocus></div>
+      <div class="field"><label>Комментарий (необязательно)</label><input id="amtNote" placeholder="Например: за товар / частичная оплата"></div>
+      <button class="btn btn-primary" id="amtSave">Сохранить</button>
+    </div>
+  </div>`;
+  document.body.insertAdjacentHTML('beforeend', html);
+  document.getElementById('closeAmount').onclick = ()=>document.getElementById('amountModal').remove();
+  document.getElementById('amtSave').onclick = async ()=>{
+    const amount = +document.getElementById('amtValue').value || 0;
+    if(amount<=0){ toast('Введите сумму больше нуля'); return; }
+    const note = document.getElementById('amtNote').value.trim();
+    d.balance = (d.balance||0) + (type==='payment'? -amount : amount);
+    d.history = d.history || [];
+    d.history.push({id:uid(), date:new Date().toISOString(), type, amount, note});
+    await idbPut('debtors', d);
+    document.getElementById('amountModal').remove();
+    const dm = document.getElementById('debtorModal'); if(dm) dm.remove();
+    toast(type==='payment' ? 'Оплата принята' : 'Долг добавлен');
+    render();
+  };
+}
+/* Найти или создать должника по имени — используется при продаже "в долг" из Кассы */
+async function findOrCreateDebtor(name){
+  const debtors = await idbGetAll('debtors');
+  let d = debtors.find(x=>x.name.toLowerCase()===name.toLowerCase());
+  if(!d){
+    d = {id: uid(), name, phone:'', balance:0, history:[]};
+  }
+  return d;
+}
+
+
 let reportPeriod = 'day';
 function periodRange(period, ref=new Date()){
   const start = new Date(ref); const end = new Date(ref);
@@ -651,6 +967,7 @@ function periodRange(period, ref=new Date()){
   }
   return {start, end};
 }
+/* ============ ОТЧЁТЫ ============ */
 async function viewReports(){
   const sales = await idbGetAll('sales');
   const {start,end} = periodRange(reportPeriod);
@@ -745,6 +1062,25 @@ async function viewSettings(){
   </div>
 
   <div class="card">
+    <div class="section-title">Общая база для нескольких устройств</div>
+    <p style="font-size:12.5px; color:var(--ink-soft); line-height:1.5;">
+      Сейчас: <b>${cloudMode? 'подключено к общей базе — все устройства видят одни и те же товары и продажи' : 'локальный режим — данные только на этом устройстве'}</b>.
+      Чтобы несколько телефонов/касс работали с одним каталогом и одной кассовой историей, подключите бесплатную
+      базу Firebase (сервис Google) и вставьте её настройки сюда — на каждом устройстве нужно сделать это один раз.
+    </p>
+    <div class="field"><label>Настройки Firebase (вставьте объект firebaseConfig целиком)</label>
+      <textarea id="fbConfigInput" rows="6" style="width:100%; padding:11px 12px; border-radius:10px; border:1.5px solid var(--line); font-family:var(--mono); font-size:12px;" placeholder='{
+  apiKey: "...",
+  authDomain: "...",
+  projectId: "...",
+  ...
+}'></textarea>
+    </div>
+    <button class="btn btn-primary" id="saveFbConfig">Подключить общую базу</button>
+    ${cloudMode? '<div style="height:8px;"></div><button class="btn btn-ghost" id="disconnectCloud">Отключить общую базу (вернуться к локальному режиму)</button>' : ''}
+  </div>
+
+  <div class="card">
     <div class="section-title">ККМ: Aisino A90 Pro / YaKassa</div>
     <p style="font-size:12.5px; color:var(--ink-soft); line-height:1.5;">
       На Aisino A90 Pro в Кыргызстане фискальную печать и передачу данных в ОФД/ГНС обычно обеспечивает
@@ -791,6 +1127,24 @@ function bindSettingsHandlers(){
     document.getElementById('shopName').textContent = v;
     toast('Название сохранено');
   };
+  const saveFb = document.getElementById('saveFbConfig');
+  if(saveFb) saveFb.onclick = async ()=>{
+    const raw = document.getElementById('fbConfigInput').value.trim();
+    if(!raw){ toast('Вставьте настройки Firebase'); return; }
+    let cfg;
+    try{ cfg = (new Function('return (' + raw + ')'))(); }
+    catch(err){ toast('Не удалось прочитать настройки — проверьте, что скопирован весь объект'); return; }
+    if(!cfg || !cfg.projectId){ toast('В настройках не хватает projectId — скопируйте объект полностью'); return; }
+    await idbPutLocal('meta', {key:'firebaseConfig', value: cfg});
+    toast('Сохранено, подключаю...');
+    location.reload();
+  };
+  const disconnectCloud = document.getElementById('disconnectCloud');
+  if(disconnectCloud) disconnectCloud.onclick = async ()=>{
+    if(!confirm('Отключить общую базу на этом устройстве? Приложение вернётся к локальным данным этого телефона.')) return;
+    await idbDeleteLocal('meta', 'firebaseConfig');
+    location.reload();
+  };
   const saveKkm = document.getElementById('saveKkm');
   if(saveKkm) saveKkm.onclick = async ()=>{
     const type = document.getElementById('kkmType').value;
@@ -825,7 +1179,10 @@ function bindSettingsHandlers(){
   };
   const wipe = document.getElementById('wipeBtn');
   if(wipe) wipe.onclick = async ()=>{
-    if(!confirm('Удалить ВСЕ товары, продажи и настройки? Это необратимо.')) return;
+    const msg = cloudMode
+      ? 'Это удалит только настройки подключения на ЭТОМ устройстве (товары и продажи в общей базе останутся). Продолжить?'
+      : 'Удалить ВСЕ товары, продажи и настройки на этом устройстве? Это необратимо.';
+    if(!confirm(msg)) return;
     indexedDB.deleteDatabase(DB_NAME);
     location.reload();
   };
@@ -836,6 +1193,7 @@ function bindDynamicHandlers(){
   if(currentTab==='kassa') bindKassaHandlers();
   if(currentTab==='prihod') bindPrihodHandlers();
   if(currentTab==='catalog') bindCatalogHandlers();
+  if(currentTab==='debts') bindDebtsHandlers();
   if(currentTab==='reports') bindReportsHandlers();
   if(currentTab==='settings') bindSettingsHandlers();
 }
@@ -843,18 +1201,24 @@ function bindDynamicHandlers(){
 /* ============ ЗАПУСК ============ */
 (async function init(){
   await openDB();
+  const connected = await initCloud();
+  const statusEl = document.getElementById('deviceStatus');
+  if(statusEl) statusEl.textContent = connected ? 'общая база · синхронизировано' : 'офлайн-режим · данные на устройстве';
+
   const shopName = (await idbGet('meta','shopName'))?.value;
   if(shopName) document.getElementById('shopName').textContent = shopName;
 
-  // немного демо-данных при первом запуске, чтобы показать логику (можно удалить в Настройках)
-  const existing = await idbGetAll('products');
-  if(existing.length===0){
-    const demo = [
-      {barcode:'4870001112223', name:'Хлеб белый', category:'Выпечка', price:25, cost:15, qty:40},
-      {barcode:'4870004445556', name:'Молоко 1л', category:'Молочные продукты', price:70, cost:52, qty:18},
-      {barcode:'4870007778889', name:'Вода питьевая 0.5л', category:'Напитки', price:20, cost:11, qty:60},
-    ];
-    for(const p of demo) await idbPut('products', p);
+  // немного демо-данных при первом запуске на локальном устройстве (не создаём в общей базе автоматически)
+  if(!cloudMode){
+    const existing = await idbGetAll('products');
+    if(existing.length===0){
+      const demo = [
+        {barcode:'4870001112223', name:'Хлеб белый', category:'Выпечка', price:25, cost:15, qty:40},
+        {barcode:'4870004445556', name:'Молоко 1л', category:'Молочные продукты', price:70, cost:52, qty:18},
+        {barcode:'4870007778889', name:'Вода питьевая 0.5л', category:'Напитки', price:20, cost:11, qty:60},
+      ];
+      for(const p of demo) await idbPut('products', p);
+    }
   }
   render();
 })();
