@@ -533,7 +533,11 @@ function showReceiptModal(sale){
         <div class="rline" style="font-weight:700; font-size:14px;"><span>ИТОГО</span><span>${fmt(sale.total)} сом</span></div>
       </div>
       <div style="height:12px;"></div>
-      <button class="btn btn-primary" id="sendKkmBtn">Отправить чек на ККМ</button>
+      <div id="kkmSendRow" class="row">
+        <button class="btn btn-primary" id="sendKkmCashBtn">💵 Пробить · наличные</button>
+        <button class="btn btn-outline" id="sendKkmCardBtn">💳 Пробить · карта</button>
+      </div>
+      <div id="kkmStatus" style="margin-top:10px; font-size:13px;"></div>
       <div style="height:8px;"></div>
       <button class="btn btn-ghost" id="closeReceipt2">Закрыть</button>
     </div>
@@ -541,43 +545,123 @@ function showReceiptModal(sale){
   document.body.insertAdjacentHTML('beforeend', html);
   document.getElementById('closeReceipt').onclick = ()=>document.getElementById('receiptModal').remove();
   document.getElementById('closeReceipt2').onclick = ()=>document.getElementById('receiptModal').remove();
-  document.getElementById('sendKkmBtn').onclick = ()=>sendToKKM(sale);
+  document.getElementById('sendKkmCashBtn').onclick = ()=>sendToKKM(sale, false);
+  document.getElementById('sendKkmCardBtn').onclick = ()=>sendToKKM(sale, true);
 }
 
-async function sendToKKM(sale){
-  const yk = await idbGet('meta','yakassa');
-  if(yk && yk.configured){
-    // ЗАГЛУШКА: реальный вызов появится, когда будет получен формат запроса от поставщика YaKassa/Ярос Групп.
-    // Ниже — заготовка структуры запроса на основе типового REST API фискальных касс;
-    // потребует уточнения точных названий полей и эндпоинта по документации поставщика.
-    try{
-      toast('Отправка чека в YaKassa...');
-      /*
-      const resp = await fetch(yk.apiUrl, {
-        method:'POST',
-        headers:{'Content-Type':'application/json', 'Authorization':'Bearer '+yk.apiKey},
-        body: JSON.stringify({
-          cashId: yk.cashId,
-          type: 'sale',
-          items: sale.items.map(i=>({name:i.name, price:i.price, quantity:i.qty, barcode:i.barcode})),
-          total: sale.total
-        })
-      });
-      const data = await resp.json();
-      */
-      toast('Настройки API сохранены. Реальный запрос будет включён, как только поступит документация YaKassa.');
-    }catch(err){
-      toast('Ошибка отправки в YaKassa: '+err.message);
-    }
-    return;
+function updateKkmStatusUI(text, success, error){
+  const el = document.getElementById('kkmStatus');
+  if(!el) return;
+  el.style.color = success ? 'var(--ok)' : (error ? 'var(--danger)' : 'var(--ink-soft)');
+  el.textContent = text;
+}
+
+/* ============ YaKassa Cloud/Local API (YAKASSA_CLOUD_API_INTEGRATION_GUIDE) ============ */
+function uuidv4(){
+  if(crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c=>{
+    const r = Math.random()*16|0, v = c==='x'?r:(r&0x3|0x8);
+    return v.toString(16);
+  });
+}
+function ykBaseUrl(yk){
+  if(yk.channel==='tcp') return `http://${yk.ip}:${yk.port||'8090'}`;
+  const path = yk.contour==='demo' ? 'ofd-0.0.1' : 'ofd-work-0.0.1';
+  return `https://ofd.yaros.kg:8143/${path}`;
+}
+function ykHeaders(yk){
+  const h = {'Content-Type':'application/json'};
+  if(yk.channel!=='tcp' && yk.token) h['token'] = String(yk.token);
+  return h;
+}
+async function ykSubmitReceipt(yk, doc){
+  const resp = await fetch(`${ykBaseUrl(yk)}/gate/receipt-v4`, { method:'POST', headers: ykHeaders(yk), body: JSON.stringify(doc) });
+  return resp.json().catch(()=>({}));
+}
+async function ykGetStatus(yk, id){
+  const resp = await fetch(`${ykBaseUrl(yk)}/gate/receipt-status-v4`, { method:'POST', headers: ykHeaders(yk), body: JSON.stringify({id}) });
+  return resp.json().catch(()=>({}));
+}
+function buildYkDocument(sale, cashless){
+  if(!sale.ykId) sale.ykId = uuidv4();
+  return {
+    id: sale.ykId,
+    operation: 'INCOME',
+    cashless: !!cashless,
+    products: sale.items.map((i,idx)=>({
+      id: String(i.barcode || ('item-'+idx)),
+      name: i.name,
+      price: i.price,
+      quantity: i.qty,
+      vat_value: 0,
+      st_value: 0,
+      calcItemAttributeCode: '0'
+    }))
+  };
+}
+async function ykPollStatus(yk, id, onUpdate){
+  const delays = [1000,2000,4000,8000,15000,15000,15000];
+  for(const d of delays){
+    await new Promise(r=>setTimeout(r,d));
+    let res;
+    try{ res = await ykGetStatus(yk, id); }
+    catch(e){ onUpdate({status:'NETWORK_ERROR', info: e.message}); return; }
+    if(res.status==='OK' || res.status==='ERROR' || res.status==='CANCELLED'){ onUpdate(res); return; }
+    onUpdate(res||{status:'PROCESSING'});
   }
-  const cfg = await idbGet('meta','kkm');
-  if(!cfg || !cfg.configured){
+  onUpdate({status:'TIMEOUT'});
+}
+
+async function sendToKKM(sale, cashless){
+  const yk = await idbGet('meta','yakassa');
+  if(!yk || !yk.configured){
     toast('ККМ не настроен. Откройте «Настройки» → «ККМ: Aisino A90 Pro / YaKassa»');
     return;
   }
-  // ЗАГЛУШКА интеграции: здесь будет реальный вызов протокола/SDK конкретной модели ККМ
-  toast('Чек отправлен на ККМ (демо-режим — нужна настройка реального устройства)');
+  const row = document.getElementById('kkmSendRow');
+  if(row) row.querySelectorAll('button').forEach(b=>b.disabled = true);
+  const doc = buildYkDocument(sale, cashless);
+  updateKkmStatusUI('Отправка чека на кассу...');
+  try{
+    await ykSubmitReceipt(yk, doc);
+    updateKkmStatusUI('Чек принят кассой, ждём фискализации...');
+    await ykPollStatus(yk, doc.id, (res)=>{
+      if(res.status==='OK'){
+        updateKkmStatusUI(`✓ Чек пробит. ФД №${res.fdNumber||'—'}${res.qr?' · QR получен':''}`, true);
+        toast('Чек успешно пробит на кассе');
+      } else if(res.status==='ERROR'){
+        updateKkmStatusUI(`✗ Ошибка кассы: ${res.info||'см. кассу'}`, false, true);
+        if(row) row.querySelectorAll('button').forEach(b=>b.disabled = false);
+      } else if(res.status==='CANCELLED'){
+        updateKkmStatusUI('✗ Операция отменена (банк или касса)', false, true);
+        if(row) row.querySelectorAll('button').forEach(b=>b.disabled = false);
+      } else if(res.status==='TIMEOUT'){
+        updateKkmStatusUI('Касса долго не отвечает. Приложение YaKassa открыто на экране кассы? Проверьте позже.', false, true);
+        if(row) row.querySelectorAll('button').forEach(b=>b.disabled = false);
+      } else if(res.status==='NETWORK_ERROR'){
+        updateKkmStatusUI('✗ Нет связи с кассой: '+(res.info||''), false, true);
+        if(row) row.querySelectorAll('button').forEach(b=>b.disabled = false);
+      } else {
+        updateKkmStatusUI('Касса обрабатывает чек...');
+      }
+    });
+  }catch(err){
+    updateKkmStatusUI('✗ Не удалось отправить: '+err.message, false, true);
+    if(row) row.querySelectorAll('button').forEach(b=>b.disabled = false);
+  }
+}
+
+async function testKkmConnection(){
+  const yk = await idbGet('meta','yakassa');
+  const ready = yk && ((yk.channel==='tcp' && yk.ip) || (yk.channel!=='tcp' && yk.token));
+  if(!ready){ toast('Сначала заполните и сохраните настройки ККМ'); return; }
+  toast('Проверяю связь с кассой...');
+  try{
+    await ykGetStatus(yk, uuidv4());
+    toast('✓ Касса ответила — связь есть');
+  }catch(err){
+    toast('✗ Нет связи с кассой: '+err.message);
+  }
 }
 
 /* ============ ПРИХОД ТОВАРА ============ */
@@ -644,13 +728,30 @@ function openPrihodModal(barcode, existing){
           <div class="field"><label>Цена продажи (сом)</label><input id="newPrice" type="number" inputmode="decimal"></div>
           <div class="field"><label>Закупочная цена (сом)</label><input id="newCost" type="number" inputmode="decimal"></div>
         </div>
-        <div class="field"><label>Оптовая цена за шт., сом — если продаёте блоками (необязательно)</label><input id="newWholesale" type="number" inputmode="decimal" placeholder="Оставьте пустым, если нет"></div>
+        <div class="field"><label>Оптовая продажа блоками (необязательно)</label></div>
+        <div class="row">
+          <div class="field"><label>Шт. в блоке</label><input id="newBlockSize" type="number" inputmode="numeric" placeholder="например, 12"></div>
+          <div class="field"><label>Цена блока целиком, сом</label><input id="newBlockPrice" type="number" inputmode="decimal" placeholder="например, 240"></div>
+        </div>
+        <div id="newBlockCalc" style="font-size:12px; color:var(--ink-soft); margin:-6px 0 10px 2px;"></div>
         <div class="field"><label>Количество (приход)</label><input id="newQty" type="number" inputmode="numeric" value="1" min="0"></div>
         <button class="btn btn-primary" id="saveNewProduct">Сохранить и оприходовать</button>
       </div>
     </div>`;
   document.body.insertAdjacentHTML('beforeend', html);
   document.getElementById('closePrihod').onclick = ()=>{ document.getElementById('prihodModal').remove(); render(); };
+
+  const blockSizeEl = document.getElementById('newBlockSize');
+  const blockPriceEl = document.getElementById('newBlockPrice');
+  const blockCalcEl = document.getElementById('newBlockCalc');
+  function updateBlockCalc(){
+    if(!blockSizeEl) return;
+    const size = +blockSizeEl.value, blockPrice = +blockPriceEl.value;
+    if(size>0 && blockPrice>0){
+      blockCalcEl.textContent = `≈ ${fmt(blockPrice/size)} сом за штуку оптом`;
+    } else blockCalcEl.textContent = '';
+  }
+  if(blockSizeEl){ blockSizeEl.addEventListener('input', updateBlockCalc); blockPriceEl.addEventListener('input', updateBlockCalc); }
 
   if(existing){
     document.getElementById('savePrihod').onclick = async ()=>{
@@ -668,11 +769,13 @@ function openPrihodModal(barcode, existing){
       const name = document.getElementById('newName').value.trim();
       const price = +document.getElementById('newPrice').value || 0;
       if(!name){ toast('Введите название товара'); return; }
+      const bSize = +blockSizeEl.value, bPrice = +blockPriceEl.value;
+      const wholesalePrice = (bSize>0 && bPrice>0) ? (bPrice/bSize) : 0;
       const prod = {
         barcode, name,
         category: document.getElementById('newCat').value.trim(),
         price, cost: +document.getElementById('newCost').value || 0,
-        wholesalePrice: +document.getElementById('newWholesale').value || 0,
+        wholesalePrice, wholesaleBlockSize: bSize||0, wholesaleBlockPrice: bPrice||0,
         qty: +document.getElementById('newQty').value || 0,
         createdAt: new Date().toISOString()
       };
@@ -761,7 +864,12 @@ function openEditProductModal(p){
         <div class="field"><label>Цена продажи</label><input id="editPrice" type="number" value="${p.price}"></div>
         <div class="field"><label>Закупочная цена</label><input id="editCost" type="number" value="${p.cost||0}"></div>
       </div>
-      <div class="field"><label>Оптовая цена за шт., сом — если продаёте блоками (необязательно)</label><input id="editWholesale" type="number" value="${p.wholesalePrice||''}" placeholder="Оставьте пустым, если нет"></div>
+      <div class="field"><label>Оптовая продажа блоками (необязательно)</label></div>
+      <div class="row">
+        <div class="field"><label>Шт. в блоке</label><input id="editBlockSize" type="number" inputmode="numeric" value="${p.wholesaleBlockSize||''}" placeholder="например, 12"></div>
+        <div class="field"><label>Цена блока целиком, сом</label><input id="editBlockPrice" type="number" inputmode="decimal" value="${p.wholesaleBlockPrice||''}" placeholder="например, 240"></div>
+      </div>
+      <div id="editBlockCalc" style="font-size:12px; color:var(--ink-soft); margin:-6px 0 10px 2px;">${p.wholesalePrice? `≈ ${fmt(p.wholesalePrice)} сом за штуку оптом` : ''}</div>
       <div class="field"><label>Остаток на складе</label><input id="editQty" type="number" value="${p.qty}"></div>
       <div class="field"><label>Штрихкод</label><input value="${p.barcode}" disabled style="opacity:.6;"></div>
       <button class="btn btn-primary" id="saveEdit">Сохранить</button>
@@ -771,12 +879,23 @@ function openEditProductModal(p){
   </div>`;
   document.body.insertAdjacentHTML('beforeend', html);
   document.getElementById('closeEdit').onclick = ()=>document.getElementById('editModal').remove();
+  const eBlockSize = document.getElementById('editBlockSize');
+  const eBlockPrice = document.getElementById('editBlockPrice');
+  const eBlockCalc = document.getElementById('editBlockCalc');
+  function updateEditBlockCalc(){
+    const size = +eBlockSize.value, blockPrice = +eBlockPrice.value;
+    eBlockCalc.textContent = (size>0 && blockPrice>0) ? `≈ ${fmt(blockPrice/size)} сом за штуку оптом` : '';
+  }
+  eBlockSize.addEventListener('input', updateEditBlockCalc);
+  eBlockPrice.addEventListener('input', updateEditBlockCalc);
   document.getElementById('saveEdit').onclick = async ()=>{
     p.name = document.getElementById('editName').value.trim();
     p.category = document.getElementById('editCat').value.trim();
     p.price = +document.getElementById('editPrice').value || 0;
     p.cost = +document.getElementById('editCost').value || 0;
-    p.wholesalePrice = +document.getElementById('editWholesale').value || 0;
+    const bSize = +eBlockSize.value, bPrice = +eBlockPrice.value;
+    p.wholesalePrice = (bSize>0 && bPrice>0) ? (bPrice/bSize) : 0;
+    p.wholesaleBlockSize = bSize||0; p.wholesaleBlockPrice = bPrice||0;
     p.qty = +document.getElementById('editQty').value || 0;
     await idbPut('products', p);
     document.getElementById('editModal').remove();
@@ -1083,16 +1202,35 @@ async function viewSettings(){
   <div class="card">
     <div class="section-title">ККМ: Aisino A90 Pro / YaKassa</div>
     <p style="font-size:12.5px; color:var(--ink-soft); line-height:1.5;">
-      На Aisino A90 Pro в Кыргызстане фискальную печать и передачу данных в ОФД/ГНС обычно обеспечивает
-      приложение <b>YaKassa</b> (Ярос Групп). Чтобы включить реальную отправку чека, запросите у поставщика
-      доступ к API: адрес сервера, API-ключ и ID вашей кассы — и укажите их здесь.
+      Выберите способ связи с кассой. Перед этим на самой кассе: <b>Настройки → Обмен</b> — включите нужный канал
+      («Обмен по HTTP» для облака или «TCP сервер» для локальной сети), приложение YaKassa должно быть открыто на экране.
     </p>
-    <div class="field"><label>Адрес API YaKassa</label><input id="ykApiUrl" placeholder="https://api.yakassa.kg/..." value="${(yk.apiUrl||'').replace(/"/g,'&quot;')}"></div>
-    <div class="field"><label>API-ключ</label><input id="ykApiKey" type="password" placeholder="выдаётся поставщиком" value="${(yk.apiKey||'').replace(/"/g,'&quot;')}"></div>
-    <div class="field"><label>ID кассы / терминала</label><input id="ykCashId" placeholder="например, номер кассы в личном кабинете" value="${(yk.cashId||'').replace(/"/g,'&quot;')}"></div>
-    <button class="btn btn-primary" id="saveYakassa">Сохранить доступ к YaKassa</button>
+    <div class="field"><label>Способ связи</label>
+      <select id="ykChannel">
+        <option value="cloud" ${yk.channel!=='tcp'?'selected':''}>Облако (Cloud HTTP) — через интернет</option>
+        <option value="tcp" ${yk.channel==='tcp'?'selected':''}>Локальная сеть (TCP) — телефон и касса в одном Wi-Fi</option>
+      </select>
+    </div>
+    <div id="ykCloudFields" style="${yk.channel==='tcp'?'display:none;':''}">
+      <div class="field"><label>Контур</label>
+        <select id="ykContour">
+          <option value="work" ${yk.contour!=='demo'?'selected':''}>Рабочий (реальные чеки)</option>
+          <option value="demo" ${yk.contour==='demo'?'selected':''}>Демо (для тестов)</option>
+        </select>
+      </div>
+      <div class="field"><label>Токен обмена (из кассы: Настройки → Обмен → Обмен по HTTP)</label><input id="ykToken" placeholder="например, 924417974" value="${(yk.token||'').replace(/"/g,'&quot;')}"></div>
+    </div>
+    <div id="ykTcpFields" style="${yk.channel==='tcp'?'':'display:none;'}">
+      <div class="row">
+        <div class="field"><label>IP-адрес кассы</label><input id="ykIp" placeholder="например, 192.168.1.50" value="${(yk.ip||'').replace(/"/g,'&quot;')}"></div>
+        <div class="field"><label>Порт</label><input id="ykPort" placeholder="8090" value="${yk.port||'8090'}"></div>
+      </div>
+    </div>
+    <button class="btn btn-primary" id="saveYakassa">Сохранить настройки ККМ</button>
     <div style="height:6px;"></div>
-    <span class="badge ${yk.configured?'badge-ok':'badge-low'}">${yk.configured? 'API указан — можно тестировать':'API не настроен — чек отправляется в демо-режиме'}</span>
+    <span class="badge ${yk.configured?'badge-ok':'badge-low'}">${yk.configured? 'Подключено — чеки уходят на настоящую кассу':'Не настроено — чек отправляется в демо-режиме'}</span>
+    <div style="height:8px;"></div>
+    <button class="btn btn-ghost" id="testKkmBtn">Проверить связь с кассой</button>
   </div>
 
   <div class="card">
@@ -1152,15 +1290,26 @@ function bindSettingsHandlers(){
     await idbPut('meta', {key:'kkm', type, address, configured: !!type});
     toast('Настройки ККМ сохранены');
   };
+  const channelSelect = document.getElementById('ykChannel');
+  if(channelSelect) channelSelect.addEventListener('change', ()=>{
+    const isTcp = channelSelect.value==='tcp';
+    document.getElementById('ykCloudFields').style.display = isTcp? 'none':'';
+    document.getElementById('ykTcpFields').style.display = isTcp? '':'none';
+  });
   const saveYk = document.getElementById('saveYakassa');
   if(saveYk) saveYk.onclick = async ()=>{
-    const apiUrl = document.getElementById('ykApiUrl').value.trim();
-    const apiKey = document.getElementById('ykApiKey').value.trim();
-    const cashId = document.getElementById('ykCashId').value.trim();
-    await idbPut('meta', {key:'yakassa', apiUrl, apiKey, cashId, configured: !!(apiUrl && apiKey)});
-    toast('Доступ к YaKassa сохранён');
+    const channel = document.getElementById('ykChannel').value;
+    const contour = document.getElementById('ykContour').value;
+    const token = document.getElementById('ykToken').value.trim();
+    const ip = document.getElementById('ykIp').value.trim();
+    const port = document.getElementById('ykPort').value.trim() || '8090';
+    const configured = channel==='tcp' ? !!ip : !!token;
+    await idbPut('meta', {key:'yakassa', channel, contour, token, ip, port, configured});
+    toast('Настройки ККМ сохранены');
     render();
   };
+  const testKkmBtn = document.getElementById('testKkmBtn');
+  if(testKkmBtn) testKkmBtn.onclick = testKkmConnection;
   const exportAll = document.getElementById('exportAllBtn');
   if(exportAll) exportAll.onclick = async ()=>{
     reportPeriod = 'quarter'; // широкий диапазон для полного экспорта не ограничен периодом
