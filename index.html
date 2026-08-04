@@ -381,11 +381,13 @@ async function viewKassa(){
 
   <div class="card">
     <div class="section-title">Товары в чеке</div>
-    ${cart.length ? cart.map((i,idx)=>`
+    ${cart.length ? cart.map((i,idx)=>{
+      const blockSize = i.wholesaleBlockSize || 0;
+      return `
       <div class="item-row">
         <div class="info">
           <div class="name">${i.name}</div>
-          <div class="meta">${fmt(i.price)} сом/шт · ${i.barcode}</div>
+          <div class="meta">${fmt(i.price)} сом/шт${i.mode==='wholesale' && blockSize>1 ? ' · шаг '+blockSize+' шт (блок)' : ''} · ${i.barcode}</div>
         </div>
         ${i.wholesalePrice ? `<button data-act="mode" data-idx="${idx}" class="badge ${i.mode==='wholesale'?'badge-accent':'badge-ok'}" style="border:none;">${i.mode==='wholesale'?'ОПТ':'РОЗН'}</button>` : ''}
         <div class="qty-stepper">
@@ -396,13 +398,13 @@ async function viewKassa(){
         <div class="line-total">${fmt(i.price*i.qty)}</div>
         <button data-act="rm" data-idx="${idx}" style="background:none;border:none;color:var(--danger);font-size:18px;">✕</button>
       </div>
-    `).join('') : `<div class="empty"><div class="big">🧾</div><p>Отсканируйте или найдите товар — он появится здесь</p></div>`}
+    `;}).join('') : `<div class="empty"><div class="big">🧾</div><p>Отсканируйте или найдите товар — он появится здесь</p></div>`}
   </div>
   `;
 }
 
 function cartLineFromProduct(p){
-  return { barcode:p.barcode, name:p.name, retailPrice:p.price, wholesalePrice:p.wholesalePrice||0, mode:'retail', price:p.price, qty:1 };
+  return { barcode:p.barcode, name:p.name, retailPrice:p.price, wholesalePrice:p.wholesalePrice||0, wholesaleBlockSize:p.wholesaleBlockSize||0, mode:'retail', price:p.price, qty:1 };
 }
 
 async function addToCart(barcode){
@@ -456,13 +458,19 @@ function bindKassaHandlers(){
   document.querySelectorAll('[data-act]').forEach(b=>{
     b.addEventListener('click', ()=>{
       const idx = +b.dataset.idx, act = b.dataset.act;
-      if(act==='inc') cart[idx].qty++;
-      if(act==='dec'){ cart[idx].qty--; if(cart[idx].qty<=0) cart.splice(idx,1); }
+      const line = cart[idx];
+      const step = (line && line.mode==='wholesale' && line.wholesaleBlockSize>1) ? line.wholesaleBlockSize : 1;
+      if(act==='inc') line.qty += step;
+      if(act==='dec'){ line.qty -= step; if(line.qty<=0) cart.splice(idx,1); }
       if(act==='rm') cart.splice(idx,1);
       if(act==='mode'){
         const i = cart[idx];
         i.mode = i.mode==='retail' ? 'wholesale' : 'retail';
         i.price = i.mode==='retail' ? i.retailPrice : i.wholesalePrice;
+        if(i.mode==='wholesale' && i.wholesaleBlockSize>1){
+          // при переходе в опт округляем количество вверх до целого числа блоков
+          i.qty = Math.ceil(i.qty / i.wholesaleBlockSize) * i.wholesaleBlockSize;
+        }
       }
       render();
     });
@@ -1273,9 +1281,39 @@ function bindSettingsHandlers(){
     try{ cfg = (new Function('return (' + raw + ')'))(); }
     catch(err){ toast('Не удалось прочитать настройки — проверьте, что скопирован весь объект'); return; }
     if(!cfg || !cfg.projectId){ toast('В настройках не хватает projectId — скопируйте объект полностью'); return; }
-    await idbPutLocal('meta', {key:'firebaseConfig', value: cfg});
-    toast('Сохранено, подключаю...');
-    location.reload();
+
+    saveFb.disabled = true;
+    toast('Переношу уже внесённые товары в общую базу...');
+    try{
+      // читаем то, что уже есть локально на этом устройстве (до переключения в облачный режим)
+      const localProducts = await idbGetAllLocal('products');
+      const localSales = await idbGetAllLocal('sales');
+      const localDebtors = await idbGetAllLocal('debtors');
+
+      if(!firebase.apps.length) firebase.initializeApp(cfg);
+      fsDB = firebase.firestore();
+
+      let moved = 0;
+      for(const p of localProducts){
+        const doc = await fsDB.collection('products').doc(String(p.barcode)).get();
+        if(!doc.exists){ await fsDB.collection('products').doc(String(p.barcode)).set(p); moved++; }
+      }
+      for(const s of localSales){
+        const doc = await fsDB.collection('sales').doc(String(s.id)).get();
+        if(!doc.exists) await fsDB.collection('sales').doc(String(s.id)).set(s);
+      }
+      for(const d of localDebtors){
+        const doc = await fsDB.collection('debtors').doc(String(d.id)).get();
+        if(!doc.exists) await fsDB.collection('debtors').doc(String(d.id)).set(d);
+      }
+      await idbPutLocal('meta', {key:'firebaseConfig', value: cfg});
+      toast(`Готово! Перенесено товаров: ${moved}. Подключаю общую базу...`);
+    }catch(err){
+      saveFb.disabled = false;
+      toast('Не удалось перенести данные: '+err.message);
+      return;
+    }
+    setTimeout(()=>location.reload(), 1200);
   };
   const disconnectCloud = document.getElementById('disconnectCloud');
   if(disconnectCloud) disconnectCloud.onclick = async ()=>{
